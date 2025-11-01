@@ -3,7 +3,5 @@
   "total_contests": 385,
   "pop_reference_share": 0.03593404531609344,
   "mean_score_reference": 1.2089047822096168,
-  "mean_score_non_reference": 1.2135178100367232,
-  "adj_score_reference": -0.006421345787644704,
-  "adj_score_non_reference": 0.00023934558564427916
+  "mean_score_non_reference": 1.2135178100367232
 }

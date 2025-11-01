@@ -391,21 +391,6 @@ def load_caption_summaries() -> pd.DataFrame:
     return all_captions
 
 
-def compute_length_adjustment(df: pd.DataFrame) -> pd.Series:
-    df = df.copy()
-    df["num_words"] = df["caption"].str.split().apply(len)
-    non_ref = df[df["pop_reference"] == 0]
-    if non_ref.empty:
-        return pd.Series(np.zeros(len(df)), index=df.index)
-    x = non_ref["num_words"].to_numpy()
-    y = non_ref["mean"].to_numpy()
-    w = non_ref["votes"].clip(lower=1).to_numpy()
-    # Fit weighted cubic polynomial to capture diminishing returns.
-    coeffs = np.polyfit(x, y, deg=3, w=w)
-    expected = np.polyval(coeffs, df["num_words"].to_numpy())
-    return pd.Series(expected, index=df.index)
-
-
 THEME_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "office": (
         "office",
@@ -494,11 +479,11 @@ def compute_polarization_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["vote_spread"] = (df["funny"] - df["not_funny"]) / df["votes"].clip(lower=1)
     df["precision"] = pd.to_numeric(df["precision"], errors="coerce")
+    df.loc[~np.isfinite(df["precision"]), "precision"] = np.nan
     grouped = df.groupby("pop_reference")
     summary = grouped.agg(
         captions=("caption", "count"),
         mean_score=("mean", "mean"),
-        mean_residual=("residual_score", "mean"),
         median_spread=("vote_spread", "median"),
         iqr_spread=("vote_spread", lambda s: s.quantile(0.75) - s.quantile(0.25)),
         high_polarization_share=("vote_spread", lambda s: (s.abs() > 0.5).mean()),
@@ -529,32 +514,28 @@ def summarize_reference_types(df: pd.DataFrame) -> pd.DataFrame:
         ref_df.groupby(["primary_category", "image_theme"])
         .agg(
             captions=("caption", "count"),
-            avg_score=("mean", "mean"),
-            adj_score=("residual_score", "mean"),
+            mean_score=("mean", "mean"),
             recent_share=("recency_bucket", lambda s: (s == "fresh (<3y)").mean()),
         )
         .reset_index()
-        .sort_values("adj_score", ascending=False)
+        .sort_values("mean_score", ascending=False)
     )
     return summary
 
 
 def build_yearly_trends(df: pd.DataFrame) -> pd.DataFrame:
     df["year"] = df["contest_date"].dt.year
-    yearly = (
-        df.groupby("year")
-        .agg(
-            total_captions=("caption", "count"),
-            pop_captions=("pop_reference", "sum"),
-            pop_score=("residual_score", lambda s: df.loc[s.index, "residual_score"][df["pop_reference"] == 1].mean()),
-        )
+    yearly = df.groupby("year").agg(
+        total_captions=("caption", "count"),
+        pop_captions=("pop_reference", "sum"),
     )
-    # Avoid chained indexing above by recomputing with clarity
     pop_mask = df["pop_reference"] == 1
+    pop_means = df.loc[pop_mask].groupby("year")["mean"].mean()
+    non_means = df.loc[~pop_mask].groupby("year")["mean"].mean()
     yearly["pop_share"] = yearly["pop_captions"] / yearly["total_captions"]
-    yearly["pop_residual"] = df.loc[pop_mask].groupby("year")["residual_score"].mean()
-    yearly["non_residual"] = df.loc[~pop_mask].groupby("year")["residual_score"].mean()
-    yearly["pop_minus_non"] = yearly["pop_residual"] - yearly["non_residual"]
+    yearly["pop_mean"] = pop_means
+    yearly["non_mean"] = non_means
+    yearly["pop_minus_non"] = yearly["pop_mean"] - yearly["non_mean"]
     yearly = yearly.reset_index()
     return yearly
 
@@ -569,10 +550,9 @@ def build_recency_table(df: pd.DataFrame) -> pd.DataFrame:
             captions=("caption", "count"),
             mean_age=("reference_age", "mean"),
             mean_score=("mean", "mean"),
-            adj_score=("residual_score", "mean"),
         )
         .reset_index()
-        .sort_values("adj_score", ascending=False)
+        .sort_values("mean_score", ascending=False)
     )
     return summary
 
@@ -586,11 +566,11 @@ def plot_yearly_trends(yearly: pd.DataFrame, out_path: Path) -> None:
     axes[0].set_title("Share of captions with pop-culture references")
     axes[0].grid(alpha=0.3)
 
-    axes[1].plot(yearly["year"], yearly["pop_residual"], label="Pop references", color="#d62728")
-    axes[1].plot(yearly["year"], yearly["non_residual"], label="Non references", color="#2ca02c")
+    axes[1].plot(yearly["year"], yearly["pop_mean"], label="Pop references", color="#d62728")
+    axes[1].plot(yearly["year"], yearly["non_mean"], label="Non references", color="#2ca02c")
     axes[1].axhline(0, color="black", linewidth=0.8, linestyle="--")
-    axes[1].set_ylabel("Adjusted score")
-    axes[1].set_title("Adjusted funniness by year")
+    axes[1].set_ylabel("Average score")
+    axes[1].set_title("Average funniness by year")
     axes[1].grid(alpha=0.3)
     axes[1].legend()
 
@@ -652,13 +632,6 @@ def main() -> None:
     )
     captions["image_theme"] = captions["image_theme"].fillna("general")
 
-    # Normalize scores
-    expected_by_length = compute_length_adjustment(captions)
-    captions["length_expected"] = expected_by_length
-    captions["length_residual"] = captions["mean"] - captions["length_expected"]
-    captions["contest_residual"] = captions.groupby("contest_id")["length_residual"].transform("mean")
-    captions["residual_score"] = captions["length_residual"] - captions["contest_residual"]
-
     # Polarization metrics
     polarization = compute_polarization_metrics(captions)
     polarization_path = out_dir / "polarization_summary.csv"
@@ -683,7 +656,6 @@ def main() -> None:
     # Additional summary stats
     pop_share = captions["pop_reference"].mean()
     avg_scores = captions.groupby("pop_reference")["mean"].mean()
-    adj_scores = captions.groupby("pop_reference")["residual_score"].mean()
 
     summary_payload = {
         "total_captions": int(len(captions)),
@@ -691,8 +663,6 @@ def main() -> None:
         "pop_reference_share": float(pop_share),
         "mean_score_reference": float(avg_scores.get(1, np.nan)),
         "mean_score_non_reference": float(avg_scores.get(0, np.nan)),
-        "adj_score_reference": float(adj_scores.get(1, np.nan)),
-        "adj_score_non_reference": float(adj_scores.get(0, np.nan)),
     }
     summary_path = out_dir / "summary_metrics.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2))
@@ -708,7 +678,7 @@ def main() -> None:
         print("\nTop reference types by image theme:")
         print(type_theme_table.head(15))
     if not yearly.empty:
-        print("\nYearly pop-culture share and adjusted performance written to", yearly_path)
+        print("\nYearly pop-culture share and average performance written to", yearly_path)
         print(f"Plot saved to {figures_dir / 'yearly_pop_culture_trends.png'}")
 
 
